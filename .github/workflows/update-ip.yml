@@ -7,144 +7,223 @@ on:
   
 permissions:
   contents: write
-  issues: write    # 添加这一行
+  issues: write
 
 jobs:
   update-ip:
     runs-on: ubuntu-22.04
-    timeout-minutes: 10    # 添加超时限制
+    timeout-minutes: 10
     
     steps:
       - uses: actions/checkout@v3
         with:
-          fetch-depth: 1     # 优化克隆深度
-    
+          fetch-depth: 0     # 获取完整历史以便更好地处理冲突
+          
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.x'
-          cache: 'pip'       # 启用pip缓存
-        
+          cache: 'pip'
+          
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
+          
       - name: Create directories
         run: |
-          echo "=== Creating Required Directories ==="
-          mkdir -p ip
-          mkdir -p data
-          touch ip/.gitkeep
+          # 创建必要的目录
+          mkdir -p ip data
+          
+          # 只在data目录下创建.gitkeep
           touch data/.gitkeep
           
-          echo "=== Directory contents ==="
-          echo "IP directory:"
-          ls -la ip/
-          echo "Data directory:"
-          ls -la data/
-
+          # 确保目录权限正确
+          chmod 755 ip data
+          
+          echo "目录结构已创建:"
+          tree -a ip data || ls -la ip data
+          
+      - name: Fetch latest changes
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git fetch origin
+          git reset --hard origin/main
+          
+      - name: Validate existing IPs
+        run: |
+          echo "=== Validating existing IPs ==="
+          python -c '
+          import socket
+          import requests
+          import time
+          import sys
+          
+          def validate_ip(ip, port):
+              try:
+                  ip = ip.strip("[]")  # 处理IPv6地址
+                  sock = socket.socket(socket.AF_INET if ":" not in ip else socket.AF_INET6)
+                  sock.settimeout(5)
+                  result = sock.connect_ex((ip, int(port)))
+                  sock.close()
+                  return result == 0
+              except:
+                  return False
+          
+          valid_ips = []
+          with open("ip/ip.txt") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  ip_port = line.split("#")[0]
+                  ip, port = ip_port.rsplit(":", 1)
+                  if validate_ip(ip, port):
+                      valid_ips.append(line)
+                  time.sleep(0.1)  # 避免请求过快
+          
+          with open("ip/ip.txt", "w") as f:
+              f.write("\n".join(valid_ips) + "\n")
+          '
+          
       - name: Run IP update script
+        id: update
         env:
           TARGET_DOMAIN: ${{ secrets.TARGET_DOMAIN }}
           TARGET_PORTS: ${{ secrets.TARGET_PORTS }}
           TARGET_URLS: ${{ secrets.TARGET_URLS }}
-          FORCE_UPDATE: "true"    # 添加强制更新环境变量
+          FORCE_UPDATE: "true"
         run: |
-          echo "=== Running IP update script ==="
-          python ip.py
+          # 最多重试3次
+          max_retries=3
+          retry_count=0
           
-          echo "=== Check file permissions ==="
-          ls -la ip/
-          ls -la data/
-        
-      - name: Generate timestamp
-        id: timestamp
-        run: echo "timestamp=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-        
-      - name: Commit and push if changed
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          
-          echo "=== Directory contents ==="
-          ls -la
-          
-          echo "=== IP directory contents ==="
-          ls -la ip/
-          
-          echo "=== Data directory contents ==="
-          ls -la data/ || echo "Data directory not found"
-          
-          echo "=== Git status before add ==="
-          git status
-          
-          echo "=== Adding files ==="
-          git add ip/
-          git add data/ || echo "No data directory to add"
-          
-          echo "=== Git status after add ==="
-          git status
-          
-          echo "=== Git diff staged ==="
-          git diff --staged
-          
-          if git diff --staged --quiet; then
-            echo "=== No changes detected ==="
-            echo "Current time: $(TZ='Asia/Shanghai' date)"
-            git status
-          else
-            echo "=== Changes detected ==="
-            echo "Current time: $(TZ='Asia/Shanghai' date)"
-            git status
-            hour=$(TZ='Asia/Shanghai' date +%H)
-            if [ "$hour" = "10" ]; then
-              echo "Updating IP list and database..."
-              git commit -m "Update IP List and GeoIP Database (${{ steps.timestamp.outputs.timestamp }})"
+          while [ $retry_count -lt $max_retries ]; do
+            if python ip.py; then
+              echo "IP更新成功"
+              break
             else
-              echo "Updating IP list..."
-              git commit -m "Update IP List (${{ steps.timestamp.outputs.timestamp }})"
+              echo "IP更新失败,正在重试($((retry_count+1))/$max_retries)"
+              retry_count=$((retry_count+1))
+              if [ $retry_count -eq $max_retries ]; then
+                echo "::error::IP更新失败,已达到最大重试次数"
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+          
+      - name: Merge changes
+        run: |
+          if [[ -n $(git status -s) ]]; then
+            echo "检测到文件变更"
+            
+            # 尝试自动合并
+            if ! git pull --rebase origin main; then
+              echo "自动合并失败,尝试手动合并"
+              
+              # 保存当前更改
+              git stash
+              
+              # 更新到最新代码
+              git reset --hard origin/main
+              
+              # 重新应用更改
+              git stash pop
+              
+              # 处理ip.txt的合并
+              python -c '
+              def merge_ip_files(file1, file2):
+                  # 读取两个文件的IP
+                  with open(file1) as f:
+                      ips1 = set(line.strip() for line in f if line.strip())
+                  with open(file2) as f:
+                      ips2 = set(line.strip() for line in f if line.strip())
+                  
+                  # 合并IP并排序
+                  merged = sorted(ips1 | ips2)
+                  
+                  # 写回文件
+                  with open(file1, "w") as f:
+                      f.write("\n".join(merged) + "\n")
+              
+              merge_ip_files("ip/ip.txt", ".git/MERGE_HEAD:ip/ip.txt")
+              '
             fi
             
-            echo "=== Pulling latest changes ==="
-            git pull --rebase
+            # 提交更改
+            git add ip/
+            git add data/ || true
             
-            echo "=== Pushing changes ==="
-            git push "https://${{ secrets.PAT }}@github.com/${GITHUB_REPOSITORY}.git"
+            # 根据北京时间决定提交信息
+            hour=$(TZ='Asia/Shanghai' date +%H)
+            if [ "$hour" = "10" ]; then
+              git commit -m "Update IP List and GeoIP Database ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
+            else
+              git commit -m "Update IP List ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
+            fi
             
-            echo "=== Successfully updated files ==="
+            # 推送更改,最多重试3次
+            max_retries=3
+            retry_count=0
+            while [ $retry_count -lt $max_retries ]; do
+              if git push origin main; then
+                echo "推送成功"
+                break
+              else
+                echo "推送失败,正在重试($((retry_count+1))/$max_retries)"
+                retry_count=$((retry_count+1))
+                if [ $retry_count -eq $max_retries ]; then
+                  echo "::error::推送失败,已达到最大重试次数"
+                  exit 1
+                fi
+                git pull --rebase
+                sleep 5
+              fi
+            done
+          else
+            echo "没有检测到文件变更"
           fi
-        
-      - name: Summary
-        if: always()
-        run: |
-          echo "=== Workflow Summary ==="
-          echo "Time: $(TZ='Asia/Shanghai' date)"
-          echo "Python script exit code: $?"
-          echo "Git status:"
-          git status --short
           
-          echo "=== Directory contents ==="
-          mkdir -p ip data  # 确保目录存在
-          echo "IP directory:"
-          ls -l ip/ || echo "IP directory is empty"
-          echo "Data directory:"
-          ls -l data/ || echo "Data directory is empty"
-          echo "=== End Summary ==="
-
       - name: Update Issue
         if: always()
         uses: actions/github-script@v6
         with:
           script: |
             const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+            const status = process.env.hour === '10' ? '✅ IP列表和GeoIP数据库已更新' : '✅ IP列表已更新';
+            
+            // 获取IP统计信息
+            const fs = require('fs');
+            let ipStats = '';
+            try {
+              const ipContent = fs.readFileSync('ip/ip.txt', 'utf8');
+              const ips = ipContent.split('\n').filter(line => line.trim());
+              const countries = {};
+              ips.forEach(ip => {
+                const country = ip.split('#')[1];
+                countries[country] = (countries[country] || 0) + 1;
+              });
+              ipStats = Object.entries(countries)
+                .map(([country, count]) => `${country}: ${count}个`)
+                .join('\n');
+            } catch (e) {
+              ipStats = '无法读取IP统计信息';
+            }
+            
             const issueBody = `
             ## IP List Update Status
             
             🕒 更新时间: ${time}
             
-            ### 更新内容
-            ${process.env.hour === '10' ? '✅ IP列表和GeoIP数据库已更新' : '✅ IP列表已更新'}
+            ### 更新状态
+            ${status}
+            
+            ### IP统计
+            \`\`\`
+            ${ipStats}
+            \`\`\`
             
             ### 文件状态
             \`\`\`
@@ -166,7 +245,7 @@ jobs:
             🤖 此消息由GitHub Actions自动生成
             `;
             
-            // 查找是否存在状态Issue
+            // 查找状态Issue
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -175,7 +254,6 @@ jobs:
             });
             
             if (issues.data.length > 0) {
-              // 更新现有Issue
               await github.rest.issues.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -183,7 +261,6 @@ jobs:
                 body: issueBody
               });
             } else {
-              // 创建新Issue
               await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
