@@ -48,35 +48,100 @@ jobs:
           cat > /tmp/merge_ips.py << 'EOF'
           import os
           import glob
+          import subprocess
           
-          def merge_ip_files(current_file, backup_file):
+          def get_file_content(file_path):
+              """获取文件内容,如果文件不存在返回空集合"""
               try:
-                  current_ips = set()
-                  if os.path.exists(current_file):
-                      with open(current_file) as f:
-                          current_ips = set(line.strip() for line in f if line.strip())
+                  if os.path.exists(file_path):
+                      with open(file_path) as f:
+                          return set(line.strip() for line in f if line.strip())
+                  return set()
+              except Exception as e:
+                  print(f"读取文件 {file_path} 失败: {str(e)}")
+                  return set()
+          
+          def get_conflict_content(file_path):
+              """获取冲突文件的两个版本内容"""
+              try:
+                  if not os.path.exists(file_path):
+                      return set(), set()
                   
-                  backup_ips = set()
-                  if os.path.exists(backup_file):
-                      with open(backup_file) as f:
-                          backup_ips = set(line.strip() for line in f if line.strip())
+                  with open(file_path) as f:
+                      content = f.read()
                   
-                  merged = sorted(current_ips | backup_ips)
+                  # 检查是否存在冲突标记
+                  if '<<<<<<< HEAD' not in content:
+                      return get_file_content(file_path), set()
                   
-                  with open(current_file, 'w') as f:
-                      f.write('\n'.join(merged))
-                      if merged:
+                  # 分割并获取两个版本的内容
+                  parts = content.split('<<<<<<< HEAD\n', 1)[1]
+                  ours, theirs = parts.split('=======\n', 1)
+                  theirs = theirs.split('>>>>>>>', 1)[0]
+                  
+                  our_ips = set(line.strip() for line in ours.splitlines() if line.strip())
+                  their_ips = set(line.strip() for line in theirs.splitlines() if line.strip())
+                  
+                  return our_ips, their_ips
+              except Exception as e:
+                  print(f"处理冲突文件 {file_path} 失败: {str(e)}")
+                  return set(), set()
+          
+          def merge_ip_files(current_file, backup_file=None):
+              """合并IP文件,处理冲突"""
+              try:
+                  # 获取当前文件的两个版本(如果有冲突)
+                  current_ips, their_ips = get_conflict_content(current_file)
+                  
+                  # 获取备份文件内容(如果有)
+                  backup_ips = get_file_content(backup_file) if backup_file else set()
+                  
+                  # 合并所有版本的IP
+                  merged = current_ips | their_ips | backup_ips
+                  
+                  # 验证IP格式
+                  valid_ips = set()
+                  for ip in merged:
+                      parts = ip.split('#')
+                      if len(parts) == 2 and ':' in parts[0]:
+                          valid_ips.add(ip)
+                  
+                  # 按国家代码分类
+                  by_country = {}
+                  for ip in valid_ips:
+                      country = ip.split('#')[1]
+                      if country not in by_country:
+                          by_country[country] = set()
+                      by_country[country].add(ip)
+                  
+                  # 创建或更新国家文件
+                  for country, ips in by_country.items():
+                      country_file = os.path.join('ip', f'{country.lower()}.txt')
+                      with open(country_file, 'w') as f:
+                          f.write('\n'.join(sorted(ips)))
                           f.write('\n')
                   
                   return True
               except Exception as e:
-                  print(f"合并文件 {current_file} 时出错: {str(e)}")
+                  print(f"合并文件失败: {str(e)}")
                   return False
           
+          # 处理所有IP文件
           success = True
-          for ip_file in glob.glob('ip/*.txt'):
-              backup_file = os.path.join('/tmp/ip_backup', os.path.basename(ip_file))
-              if not merge_ip_files(ip_file, backup_file):
+          
+          # 获取所有相关文件
+          ip_files = set()
+          ip_files.update(glob.glob('ip/*.txt'))
+          if os.path.exists('/tmp/ip_backup'):
+              ip_files.update(glob.glob('/tmp/ip_backup/*.txt'))
+          
+          # 合并每个文件
+          for ip_file in ip_files:
+              base_name = os.path.basename(ip_file)
+              current_file = os.path.join('ip', base_name)
+              backup_file = os.path.join('/tmp/ip_backup', base_name)
+              
+              if not merge_ip_files(current_file, backup_file):
                   success = False
           
           exit(0 if success else 1)
@@ -110,24 +175,46 @@ jobs:
         run: |
           if [[ -n $(git status -s) ]]; then
             echo "检测到文件变更"
+            
+            # 保存当前更改
             git stash
+            
+            # 更新到最新代码
             git fetch origin
             git reset --hard origin/main
             
+            # 备份当前IP文件
             mkdir -p /tmp/ip_backup
             cp ip/*.txt /tmp/ip_backup/ 2>/dev/null || true
             
-            git stash pop || true
-            python /tmp/merge_ips.py
-            
-            if [ $? -ne 0 ]; then
-              echo "IP列表合并失败"
-              exit 1
+            # 应用本地更改并处理冲突
+            if ! git stash pop; then
+              echo "存在冲突,尝试自动解决..."
+              python /tmp/merge_ips.py
+              
+              if [ $? -ne 0 ]; then
+                echo "IP列表合并失败"
+                git rebase --abort
+                exit 1
+              fi
+              
+              # 标记冲突已解决
+              git add ip/
+            else
+              # 没有冲突,正常合并
+              python /tmp/merge_ips.py
+              
+              if [ $? -ne 0 ]; then
+                echo "IP列表合并失败"
+                exit 1
+              fi
+              
+              git add ip/
             fi
             
-            git add ip/
             git add data/ || true
             
+            # 提交更改
             hour=$(TZ='Asia/Shanghai' date +%H)
             if [ "$hour" = "10" ]; then
               git commit -m "Update IP List and GeoIP Database ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
@@ -135,6 +222,7 @@ jobs:
               git commit -m "Update IP List ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
             fi
             
+            # 推送更改
             max_retries=3
             retry_count=0
             while [ $retry_count -lt $max_retries ]; do
@@ -148,9 +236,17 @@ jobs:
                   echo "::error::推送失败,已达到最大重试次数"
                   exit 1
                 fi
+                
+                # 重新拉取并合并
                 git fetch origin
                 git reset --hard origin/main
                 python /tmp/merge_ips.py
+                
+                if [ $? -ne 0 ]; then
+                  echo "IP列表合并失败"
+                  exit 1
+                fi
+                
                 git add ip/
                 if [ "$hour" = "10" ]; then
                   git commit -m "Update IP List and GeoIP Database ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
