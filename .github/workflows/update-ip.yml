@@ -1,0 +1,193 @@
+name: Update IP List
+
+on:
+  schedule:
+    - cron: '10 * * * *'    # 每小时10分运行 
+  workflow_dispatch:        # 允许手动触发
+  
+permissions:
+  contents: write          # 允许写入仓库内容
+
+jobs:
+  update-ip:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10    # 添加超时限制
+    
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 1     # 优化克隆深度
+    
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+          cache: 'pip'       # 启用pip缓存
+        
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Create directories
+        run: |
+          echo "=== Creating Required Directories ==="
+          mkdir -p ip
+          mkdir -p data
+          touch ip/.gitkeep
+          touch data/.gitkeep
+          
+          echo "=== Directory contents ==="
+          echo "IP directory:"
+          ls -la ip/
+          echo "Data directory:"
+          ls -la data/
+
+      - name: Run IP update script
+        env:
+          TARGET_DOMAIN: ${{ secrets.TARGET_DOMAIN }}
+          TARGET_PORTS: ${{ secrets.TARGET_PORTS }}
+          TARGET_URLS: ${{ secrets.TARGET_URLS }}
+          FORCE_UPDATE: "true"    # 添加强制更新环境变量
+        run: |
+          echo "=== Running IP update script ==="
+          python ip.py
+          
+          echo "=== Check file permissions ==="
+          ls -la ip/
+          ls -la data/
+        
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "timestamp=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+        
+      - name: Commit and push if changed
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          
+          echo "=== Directory contents ==="
+          ls -la
+          
+          echo "=== IP directory contents ==="
+          ls -la ip/
+          
+          echo "=== Data directory contents ==="
+          ls -la data/ || echo "Data directory not found"
+          
+          echo "=== Git status before add ==="
+          git status
+          
+          echo "=== Adding files ==="
+          git add ip/
+          git add data/ || echo "No data directory to add"
+          
+          echo "=== Git status after add ==="
+          git status
+          
+          echo "=== Git diff staged ==="
+          git diff --staged
+          
+          if git diff --staged --quiet; then
+            echo "=== No changes detected ==="
+            echo "Current time: $(TZ='Asia/Shanghai' date)"
+            git status
+          else
+            echo "=== Changes detected ==="
+            echo "Current time: $(TZ='Asia/Shanghai' date)"
+            git status
+            hour=$(TZ='Asia/Shanghai' date +%H)
+            if [ "$hour" = "10" ]; then
+              echo "Updating IP list and database..."
+              git commit -m "Update IP List and GeoIP Database (${{ steps.timestamp.outputs.timestamp }})"
+            else
+              echo "Updating IP list..."
+              git commit -m "Update IP List (${{ steps.timestamp.outputs.timestamp }})"
+            fi
+            
+            echo "=== Pulling latest changes ==="
+            git pull --rebase
+            
+            echo "=== Pushing changes ==="
+            git push "https://${{ secrets.PAT }}@github.com/${GITHUB_REPOSITORY}.git"
+            
+            echo "=== Successfully updated files ==="
+          fi
+        
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== Workflow Summary ==="
+          echo "Time: $(TZ='Asia/Shanghai' date)"
+          echo "Python script exit code: $?"
+          echo "Git status:"
+          git status --short
+          
+          echo "=== Directory contents ==="
+          mkdir -p ip data  # 确保目录存在
+          echo "IP directory:"
+          ls -l ip/ || echo "IP directory is empty"
+          echo "Data directory:"
+          ls -l data/ || echo "Data directory is empty"
+          echo "=== End Summary ==="
+
+      - name: Update Issue
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+            const issueBody = `
+            ## IP List Update Status
+            
+            🕒 更新时间: ${time}
+            
+            ### 更新内容
+            ${process.env.hour === '10' ? '✅ IP列表和GeoIP数据库已更新' : '✅ IP列表已更新'}
+            
+            ### 文件状态
+            \`\`\`
+            ${require('child_process').execSync('git status -s').toString()}
+            \`\`\`
+            
+            ### 目录内容
+            IP目录:
+            \`\`\`
+            ${require('child_process').execSync('ls -l ip/').toString()}
+            \`\`\`
+            
+            Data目录:
+            \`\`\`
+            ${require('child_process').execSync('ls -l data/').toString()}
+            \`\`\`
+            
+            ---
+            🤖 此消息由GitHub Actions自动生成
+            `;
+            
+            // 查找是否存在状态Issue
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['status'],
+              state: 'open'
+            });
+            
+            if (issues.data.length > 0) {
+              // 更新现有Issue
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues.data[0].number,
+                body: issueBody
+              });
+            } else {
+              // 创建新Issue
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'IP List Update Status',
+                body: issueBody,
+                labels: ['status']
+              });
+            }
