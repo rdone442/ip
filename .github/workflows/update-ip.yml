@@ -2,9 +2,9 @@ name: Update IP List
 
 on:
   schedule:
-    - cron: '10 * * * *'    # 每小时10分运行 
-  workflow_dispatch:        # 允许手动触发
-  
+    - cron: '10 * * * *'
+  workflow_dispatch:
+
 permissions:
   contents: write
   issues: write
@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
         with:
-          fetch-depth: 0     # 获取完整历史以便更好地处理冲突
+          fetch-depth: 0
           
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -32,73 +32,65 @@ jobs:
           
       - name: Create directories
         run: |
-          # 创建必要的目录
           mkdir -p ip data
-          
-          # 只在data目录下创建.gitkeep
           touch data/.gitkeep
-          
-          # 确保目录权限正确
           chmod 755 ip data
-          
           echo "目录结构已创建:"
           tree -a ip data || ls -la ip data
           
-      - name: Fetch latest changes
+      - name: Setup git
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
-          git fetch origin
-          git reset --hard origin/main
           
-      - name: Validate existing IPs
+      - name: Create merge script
         run: |
-          echo "=== Validating existing IPs ==="
-          python -c '
-          import socket
-          import requests
-          import time
-          import sys
+          cat > /tmp/merge_ips.py << 'EOF'
+          import os
+          import glob
           
-          def validate_ip(ip, port):
+          def merge_ip_files(current_file, backup_file):
               try:
-                  ip = ip.strip("[]")  # 处理IPv6地址
-                  sock = socket.socket(socket.AF_INET if ":" not in ip else socket.AF_INET6)
-                  sock.settimeout(5)
-                  result = sock.connect_ex((ip, int(port)))
-                  sock.close()
-                  return result == 0
-              except:
+                  current_ips = set()
+                  if os.path.exists(current_file):
+                      with open(current_file) as f:
+                          current_ips = set(line.strip() for line in f if line.strip())
+                  
+                  backup_ips = set()
+                  if os.path.exists(backup_file):
+                      with open(backup_file) as f:
+                          backup_ips = set(line.strip() for line in f if line.strip())
+                  
+                  merged = sorted(current_ips | backup_ips)
+                  
+                  with open(current_file, 'w') as f:
+                      f.write('\n'.join(merged))
+                      if merged:
+                          f.write('\n')
+                  
+                  return True
+              except Exception as e:
+                  print(f"合并文件 {current_file} 时出错: {str(e)}")
                   return False
           
-          valid_ips = []
-          with open("ip/ip.txt") as f:
-              for line in f:
-                  line = line.strip()
-                  if not line:
-                      continue
-                  ip_port = line.split("#")[0]
-                  ip, port = ip_port.rsplit(":", 1)
-                  if validate_ip(ip, port):
-                      valid_ips.append(line)
-                  time.sleep(0.1)  # 避免请求过快
+          success = True
+          for ip_file in glob.glob('ip/*.txt'):
+              backup_file = os.path.join('/tmp/ip_backup', os.path.basename(ip_file))
+              if not merge_ip_files(ip_file, backup_file):
+                  success = False
           
-          with open("ip/ip.txt", "w") as f:
-              f.write("\n".join(valid_ips) + "\n")
-          '
+          exit(0 if success else 1)
+          EOF
           
       - name: Run IP update script
-        id: update
         env:
           TARGET_DOMAIN: ${{ secrets.TARGET_DOMAIN }}
           TARGET_PORTS: ${{ secrets.TARGET_PORTS }}
           TARGET_URLS: ${{ secrets.TARGET_URLS }}
           FORCE_UPDATE: "true"
         run: |
-          # 最多重试3次
           max_retries=3
           retry_count=0
-          
           while [ $retry_count -lt $max_retries ]; do
             if python ip.py; then
               echo "IP更新成功"
@@ -114,49 +106,28 @@ jobs:
             fi
           done
           
-      - name: Merge changes
+      - name: Process changes
         run: |
           if [[ -n $(git status -s) ]]; then
             echo "检测到文件变更"
+            git stash
+            git fetch origin
+            git reset --hard origin/main
             
-            # 尝试自动合并
-            if ! git pull --rebase origin main; then
-              echo "自动合并失败,尝试手动合并"
-              
-              # 保存当前更改
-              git stash
-              
-              # 更新到最新代码
-              git reset --hard origin/main
-              
-              # 重新应用更改
-              git stash pop
-              
-              # 处理ip.txt的合并
-              python -c '
-              def merge_ip_files(file1, file2):
-                  # 读取两个文件的IP
-                  with open(file1) as f:
-                      ips1 = set(line.strip() for line in f if line.strip())
-                  with open(file2) as f:
-                      ips2 = set(line.strip() for line in f if line.strip())
-                  
-                  # 合并IP并排序
-                  merged = sorted(ips1 | ips2)
-                  
-                  # 写回文件
-                  with open(file1, "w") as f:
-                      f.write("\n".join(merged) + "\n")
-              
-              merge_ip_files("ip/ip.txt", ".git/MERGE_HEAD:ip/ip.txt")
-              '
+            mkdir -p /tmp/ip_backup
+            cp ip/*.txt /tmp/ip_backup/ 2>/dev/null || true
+            
+            git stash pop || true
+            python /tmp/merge_ips.py
+            
+            if [ $? -ne 0 ]; then
+              echo "IP列表合并失败"
+              exit 1
             fi
             
-            # 提交更改
             git add ip/
             git add data/ || true
             
-            # 根据北京时间决定提交信息
             hour=$(TZ='Asia/Shanghai' date +%H)
             if [ "$hour" = "10" ]; then
               git commit -m "Update IP List and GeoIP Database ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
@@ -164,7 +135,6 @@ jobs:
               git commit -m "Update IP List ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
             fi
             
-            # 推送更改,最多重试3次
             max_retries=3
             retry_count=0
             while [ $retry_count -lt $max_retries ]; do
@@ -178,7 +148,15 @@ jobs:
                   echo "::error::推送失败,已达到最大重试次数"
                   exit 1
                 fi
-                git pull --rebase
+                git fetch origin
+                git reset --hard origin/main
+                python /tmp/merge_ips.py
+                git add ip/
+                if [ "$hour" = "10" ]; then
+                  git commit -m "Update IP List and GeoIP Database ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
+                else
+                  git commit -m "Update IP List ($(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S'))"
+                fi
                 sleep 5
               fi
             done
@@ -194,10 +172,9 @@ jobs:
             const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
             const status = process.env.hour === '10' ? '✅ IP列表和GeoIP数据库已更新' : '✅ IP列表已更新';
             
-            // 获取IP统计信息
-            const fs = require('fs');
             let ipStats = '';
             try {
+              const fs = require('fs');
               const ipContent = fs.readFileSync('ip/ip.txt', 'utf8');
               const ips = ipContent.split('\n').filter(line => line.trim());
               const countries = {};
@@ -245,7 +222,6 @@ jobs:
             🤖 此消息由GitHub Actions自动生成
             `;
             
-            // 查找状态Issue
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
