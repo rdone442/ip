@@ -6,7 +6,8 @@ on:
   workflow_dispatch:        # 允许手动触发
   
 permissions:
-  contents: write          # 允许写入仓库内容
+  contents: write
+  issues: write    # 添加这一行
 
 jobs:
   update-ip:
