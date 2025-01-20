@@ -8,12 +8,17 @@ import datetime
 from urllib.parse import quote
 import time
 import concurrent.futures
+from collections import defaultdict
 
-# 修改全局变量来优化执行时间
+# 优化全局变量
 LAST_API_CALL = 0
-MIN_INTERVAL = 1.0  # 减少等待时间
-MAX_RETRIES = 2    # 减少重试次数
-MAX_WORKERS = 5    # 并发查询数量
+MIN_INTERVAL = 0.5  # 进一步减少等待时间
+MAX_RETRIES = 2
+MAX_WORKERS = 20   # 增加并发数
+BATCH_SIZE = 100   # 批量处理大小
+
+# 添加缓存
+IP_COUNTRY_CACHE = {}
 
 def ensure_dir(directory):
     """确保目录存在，如果不存在则创建"""
@@ -127,70 +132,52 @@ def wait_for_api():
     LAST_API_CALL = time.time()
 
 def get_country_code(ip, reader):
-    """查询IP所属国家代码，先用数据库，失败后用ip-api.com"""
+    """查询IP所属国家代码，使用缓存优化"""
+    # 检查缓存
+    if ip in IP_COUNTRY_CACHE:
+        return IP_COUNTRY_CACHE[ip]
+    
     # 首先尝试使用GeoIP2数据库
     try:
         response = reader.country(ip)
         country_code = response.country.iso_code
         if country_code:
-            print(f"[数据库查询成功] IP: {ip} 国家代码: {country_code}")
+            IP_COUNTRY_CACHE[ip] = country_code
             return country_code
     except Exception as e:
-        print(f"[数据库查询失败] IP: {ip} 错误信息: {str(e)}")
+        pass
     
     # 数据库查询失败，尝试使用ip-api.com
     retries = 0
     while retries < MAX_RETRIES:
         try:
-            print(f"[尝试在线查询] IP: {ip} (尝试 {retries + 1}/{MAX_RETRIES})")
-            wait_for_api()  # 等待适当的时间间隔
+            wait_for_api()
             response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
             
-            # 处理429状态码
             if response.status_code == 429:
                 retries += 1
                 if retries < MAX_RETRIES:
-                    wait_time = (2 ** retries) * MIN_INTERVAL  # 指数退避
-                    print(f"[速率限制] 等待 {wait_time} 秒后重试...")
+                    wait_time = (2 ** retries) * MIN_INTERVAL
                     time.sleep(wait_time)
                     continue
-                else:
-                    print(f"[在线查询失败] IP: {ip} 达到最大重试次数")
-                    return "XX"
+                break
             
-            # 检查其他状态码
             if response.status_code != 200:
-                print(f"[在线查询失败] IP: {ip} HTTP状态码: {response.status_code}")
-                return "XX"
+                break
             
-            # 检查响应内容是否为空
-            if not response.text.strip():
-                print(f"[在线查询失败] IP: {ip} 响应为空")
-                return "XX"
-            
-            try:
-                data = response.json()
-            except ValueError as e:
-                print(f"[在线查询失败] IP: {ip} JSON解析错误: {str(e)}")
-                print(f"响应内容: {response.text[:200]}")  # 只打印前200个字符
-                return "XX"
-            
+            data = response.json()
             if data.get("status") == "success":
                 country_code = data.get("countryCode", "XX")
-                print(f"[在线查询成功] IP: {ip} 国家代码: {country_code}")
+                IP_COUNTRY_CACHE[ip] = country_code
                 return country_code
-            else:
-                print(f"[在线查询失败] IP: {ip} 错误信息: {data.get('message', '未知错误')}")
-                return "XX"
                 
-        except requests.exceptions.Timeout:
-            print(f"[在线查询超时] IP: {ip}")
-            return "XX"
-        except Exception as e:
-            print(f"[在线查询错误] IP: {ip} 错误信息: {str(e)}")
-            return "XX"
-            
-    return "XX"  # 所有重试都失败后返回XX
+        except Exception:
+            break
+        
+        retries += 1
+    
+    IP_COUNTRY_CACHE[ip] = "XX"
+    return "XX"
 
 def resolve_domain(reader):
     """解析域名获取IP"""
@@ -272,32 +259,36 @@ def resolve_domain(reader):
         return []
 
 def batch_process_ips(ip_list, reader, ports):
-    """批量处理IP地址"""
+    """批量处理IP地址，使用分批处理优化内存使用"""
     results = []
-    country_results = {}
+    country_results = defaultdict(list)
     
-    # 使用线程池并发处理IP
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # 创建任务
-        future_to_ip = {executor.submit(process_single_ip, ip, reader, ports): ip for ip in ip_list}
+    # 分批处理IP
+    for i in range(0, len(ip_list), BATCH_SIZE):
+        batch = ip_list[i:i + BATCH_SIZE]
         
-        # 处理结果
-        for future in concurrent.futures.as_completed(future_to_ip):
-            ip = future_to_ip[future]
-            try:
-                ip_results = future.result()
-                if ip_results:
-                    for result in ip_results:
-                        results.append(result)
-                        # 解析结果获取国家代码
-                        country_code = result.split('#')[-1]
-                        if country_code not in country_results:
-                            country_results[country_code] = []
-                        country_results[country_code].append(result)
-            except Exception as e:
-                print(f"处理IP {ip} 时发生错误: {str(e)}")
-                
-    return results, country_results
+        # 使用线程池并发处理当前批次
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_ip = {executor.submit(process_single_ip, ip, reader, ports): ip for ip in batch}
+            
+            for future in concurrent.futures.as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                try:
+                    ip_results = future.result()
+                    if ip_results:
+                        for result in ip_results:
+                            results.append(result)
+                            country_code = result.split('#')[-1]
+                            country_results[country_code].append(result)
+                except Exception as e:
+                    print(f"处理IP {ip} 时发生错误: {str(e)}")
+        
+        # 处理完一批后，立即写入文件
+        save_results(dict(country_results))
+        # 清空当前批次的结果，释放内存
+        country_results.clear()
+    
+    return results
 
 def process_single_ip(ip, reader, ports):
     """处理单个IP地址"""
@@ -330,10 +321,23 @@ def process_single_ip(ip, reader, ports):
         
     return results
 
+def save_results(country_results):
+    """保存结果到文件"""
+    ip_dir = "ip"
+    ensure_dir(ip_dir)
+    
+    for country_code, country_ips in country_results.items():
+        if country_code == "XX":
+            continue
+            
+        filename = os.path.join(ip_dir, f'{country_code.lower()}.txt')
+        with open(filename, 'a', encoding='utf-8') as f:
+            for result in country_ips:
+                f.write(f'{result}\n')
+
 def read_ip_from_url(reader):
     """从多个URL读取IP列表并查询国家代码"""
     try:
-        # 获取URL列表
         if 'TARGET_URLS' not in os.environ:
             print('错误：未设置 TARGET_URLS 环境变量')
             return []
@@ -345,16 +349,20 @@ def read_ip_from_url(reader):
             print('错误：TARGET_URLS 环境变量为空')
             return []
         
-        # 获取端口列表
         ports = os.environ.get('TARGET_PORTS', '443').split(',')
         ports = [port.strip() for port in ports if port.strip().isdigit()]
         if not ports:
-            print('警告：未设置有效的 TARGET_PORTS 环境变量，使用默认端口443')
             ports = ['443']
         
-        all_ips = set()  # 使用集合去重
+        # 清空输出目录
+        ip_dir = "ip"
+        if os.path.exists(ip_dir):
+            for file in os.listdir(ip_dir):
+                os.remove(os.path.join(ip_dir, file))
         
-        # 从所有URL收集IP
+        all_ips = set()
+        
+        # 收集所有IP
         for url in urls:
             try:
                 encoded_url = quote(url, safe=':/?=')
@@ -369,25 +377,8 @@ def read_ip_from_url(reader):
                 print(f'处理URL {url} 时发生错误: {str(e)}')
                 continue
         
-        # 批量处理收集到的所有IP
-        results, country_results = batch_process_ips(list(all_ips), reader, ports)
-        
-        # 确保ip目录存在
-        ip_dir = "ip"
-        ensure_dir(ip_dir)
-        
-        # 为每个国家创建单独的文件
-        for country_code, country_ips in country_results.items():
-            if country_code == "XX":  # 跳过未知国家
-                continue
-                
-            filename = os.path.join(ip_dir, f'{country_code.lower()}.txt')
-            with open(filename, 'w', encoding='utf-8') as f:
-                for result in country_ips:
-                    f.write(f'{result}\n')
-            print(f"\n[URL读取] 发现 {len(country_ips)} 个 {country_code} 地址，已保存到 {filename}")
-                
-        return results
+        print(f"\n[处理] 共收集到 {len(all_ips)} 个唯一IP地址")
+        return batch_process_ips(list(all_ips), reader, ports)
             
     except Exception as e:
         print(f'URL读取发生错误: {str(e)}')
