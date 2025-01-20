@@ -7,11 +7,13 @@ from dotenv import load_dotenv
 import datetime
 from urllib.parse import quote
 import time
+import concurrent.futures
 
-# 添加全局变量来控制请求频率
+# 修改全局变量来优化执行时间
 LAST_API_CALL = 0
-MIN_INTERVAL = 1.5  # 每次请求之间的最小间隔（秒）
-MAX_RETRIES = 3    # 最大重试次数
+MIN_INTERVAL = 1.0  # 减少等待时间
+MAX_RETRIES = 2    # 减少重试次数
+MAX_WORKERS = 5    # 并发查询数量
 
 def ensure_dir(directory):
     """确保目录存在，如果不存在则创建"""
@@ -269,6 +271,65 @@ def resolve_domain(reader):
         print(f'域名解析发生错误: {str(e)}')
         return []
 
+def batch_process_ips(ip_list, reader, ports):
+    """批量处理IP地址"""
+    results = []
+    country_results = {}
+    
+    # 使用线程池并发处理IP
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 创建任务
+        future_to_ip = {executor.submit(process_single_ip, ip, reader, ports): ip for ip in ip_list}
+        
+        # 处理结果
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                ip_results = future.result()
+                if ip_results:
+                    for result in ip_results:
+                        results.append(result)
+                        # 解析结果获取国家代码
+                        country_code = result.split('#')[-1]
+                        if country_code not in country_results:
+                            country_results[country_code] = []
+                        country_results[country_code].append(result)
+            except Exception as e:
+                print(f"处理IP {ip} 时发生错误: {str(e)}")
+                
+    return results, country_results
+
+def process_single_ip(ip, reader, ports):
+    """处理单个IP地址"""
+    results = []
+    try:
+        ip = ip.strip()
+        if not ip:
+            return results
+            
+        # 添加IP验证和规范化
+        if not is_valid_ip(ip):
+            print(f"[URL读取] 跳过无效IP: {ip}")
+            return results
+            
+        # 规范化IP地址
+        normalized_ip = normalize_ip(ip) or ip
+        country_code = get_country_code(normalized_ip.strip('[]'), reader)
+        
+        # 为每个端口生成结果
+        for port in ports:
+            result = f'{normalized_ip}:{port}#{country_code}'
+            results.append(result)
+            if ip != normalized_ip:
+                print(f"[URL读取] {result} (原始IP: {ip})")
+            else:
+                print(f"[URL读取] {result}")
+                
+    except Exception as e:
+        print(f"处理IP {ip} 时发生错误: {str(e)}")
+        
+    return results
+
 def read_ip_from_url(reader):
     """从多个URL读取IP列表并查询国家代码"""
     try:
@@ -284,61 +345,32 @@ def read_ip_from_url(reader):
             print('错误：TARGET_URLS 环境变量为空')
             return []
         
-        results = []
-        country_results = {}  # 使用字典存储不同国家的结果
-        
-        # 获取端口列表，如果环境变量未设置则使用默认端口443
+        # 获取端口列表
         ports = os.environ.get('TARGET_PORTS', '443').split(',')
         ports = [port.strip() for port in ports if port.strip().isdigit()]
         if not ports:
             print('警告：未设置有效的 TARGET_PORTS 环境变量，使用默认端口443')
             ports = ['443']
         
-        # 处理每个URL
+        all_ips = set()  # 使用集合去重
+        
+        # 从所有URL收集IP
         for url in urls:
             try:
-                # 对URL进行编码，确保特殊字符被正确处理
                 encoded_url = quote(url, safe=':/?=')
                 print(f"\n[URL读取] 正在从 {url} 获取IP列表...")
                 response = requests.get(encoded_url, timeout=10)
                 response.raise_for_status()
                 
                 ip_list = response.text.strip().split()
+                all_ips.update(ip.strip() for ip in ip_list if ip.strip())
                 
-                for ip in ip_list:
-                    ip = ip.strip()
-                    if not ip:
-                        continue
-                        
-                    # 添加IP验证和规范化
-                    if not is_valid_ip(ip):
-                        print(f"[URL读取] 跳过无效IP: {ip}")
-                        continue
-                        
-                    # 规范化IP地址
-                    normalized_ip = normalize_ip(ip) or ip
-                    country_code = get_country_code(normalized_ip.strip('[]'), reader)
-                    
-                    # 为每个端口生成一个结果，使用规范化的IP
-                    for port in ports:
-                        result = f'{normalized_ip}:{port}#{country_code}'
-                        results.append(result)
-                        if ip != normalized_ip:
-                            print(f"[URL读取] {result} (原始IP: {ip})")
-                        else:
-                            print(f"[URL读取] {result}")
-                        
-                        # 将结果添加到对应国家的列表中
-                        if country_code not in country_results:
-                            country_results[country_code] = []
-                        country_results[country_code].append(result)
-                        
-            except requests.RequestException as e:
-                print(f'获取URL {url} 失败: {str(e)}')
-                continue
             except Exception as e:
                 print(f'处理URL {url} 时发生错误: {str(e)}')
                 continue
+        
+        # 批量处理收集到的所有IP
+        results, country_results = batch_process_ips(list(all_ips), reader, ports)
         
         # 确保ip目录存在
         ip_dir = "ip"
