@@ -139,15 +139,20 @@ def get_country_code(ip, reader):
     
     # 首先尝试使用GeoIP2数据库
     try:
+        print(f"[数据库查询] 正在查询IP: {ip}")
         response = reader.country(ip)
         country_code = response.country.iso_code
         if country_code:
+            print(f"[数据库查询成功] IP: {ip} 国家代码: {country_code}")
             IP_COUNTRY_CACHE[ip] = country_code
             return country_code
+        else:
+            print(f"[数据库查询失败] IP: {ip} 未返回国家代码")
     except Exception as e:
-        pass
+        print(f"[数据库查询错误] IP: {ip} 错误信息: {str(e)}")
     
     # 数据库查询失败，尝试使用ip-api.com
+    print(f"[切换API] IP: {ip} 使用在线API查询")
     retries = 0
     while retries < MAX_RETRIES:
         try:
@@ -158,24 +163,32 @@ def get_country_code(ip, reader):
                 retries += 1
                 if retries < MAX_RETRIES:
                     wait_time = (2 ** retries) * MIN_INTERVAL
+                    print(f"[速率限制] IP: {ip} 等待 {wait_time} 秒后重试")
                     time.sleep(wait_time)
                     continue
+                print(f"[查询失败] IP: {ip} 达到最大重试次数")
                 break
             
             if response.status_code != 200:
+                print(f"[查询失败] IP: {ip} HTTP状态码: {response.status_code}")
                 break
             
             data = response.json()
             if data.get("status") == "success":
                 country_code = data.get("countryCode", "XX")
+                print(f"[在线查询成功] IP: {ip} 国家代码: {country_code}")
                 IP_COUNTRY_CACHE[ip] = country_code
                 return country_code
+            else:
+                print(f"[在线查询失败] IP: {ip} 响应: {data}")
                 
-        except Exception:
+        except Exception as e:
+            print(f"[在线查询错误] IP: {ip} 错误信息: {str(e)}")
             break
         
         retries += 1
     
+    print(f"[查询结束] IP: {ip} 无法确定国家代码，使用XX")
     IP_COUNTRY_CACHE[ip] = "XX"
     return "XX"
 
