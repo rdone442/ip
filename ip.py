@@ -6,6 +6,12 @@ import sys
 from dotenv import load_dotenv
 import datetime
 from urllib.parse import quote
+import time
+
+# 添加全局变量来控制请求频率
+LAST_API_CALL = 0
+MIN_INTERVAL = 1.5  # 每次请求之间的最小间隔（秒）
+MAX_RETRIES = 3    # 最大重试次数
 
 def ensure_dir(directory):
     """确保目录存在，如果不存在则创建"""
@@ -110,6 +116,14 @@ def download_mmdb():
         print(f"下载GeoIP2数据库失败: {str(e)}")
         sys.exit(1)
 
+def wait_for_api():
+    """等待足够的时间间隔再发送下一个请求"""
+    global LAST_API_CALL
+    current_time = time.time()
+    if current_time - LAST_API_CALL < MIN_INTERVAL:
+        time.sleep(MIN_INTERVAL - (current_time - LAST_API_CALL))
+    LAST_API_CALL = time.time()
+
 def get_country_code(ip, reader):
     """查询IP所属国家代码，先用数据库，失败后用ip-api.com"""
     # 首先尝试使用GeoIP2数据库
@@ -123,41 +137,58 @@ def get_country_code(ip, reader):
         print(f"[数据库查询失败] IP: {ip} 错误信息: {str(e)}")
     
     # 数据库查询失败，尝试使用ip-api.com
-    try:
-        print(f"[尝试在线查询] IP: {ip}")
-        response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
-        
-        # 检查响应状态码
-        if response.status_code != 200:
-            print(f"[在线查询失败] IP: {ip} HTTP状态码: {response.status_code}")
-            return "XX"
-            
-        # 检查响应内容是否为空
-        if not response.text.strip():
-            print(f"[在线查询失败] IP: {ip} 响应为空")
-            return "XX"
-            
+    retries = 0
+    while retries < MAX_RETRIES:
         try:
-            data = response.json()
-        except ValueError as e:
-            print(f"[在线查询失败] IP: {ip} JSON解析错误: {str(e)}")
-            print(f"响应内容: {response.text[:200]}")  # 只打印前200个字符
+            print(f"[尝试在线查询] IP: {ip} (尝试 {retries + 1}/{MAX_RETRIES})")
+            wait_for_api()  # 等待适当的时间间隔
+            response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
+            
+            # 处理429状态码
+            if response.status_code == 429:
+                retries += 1
+                if retries < MAX_RETRIES:
+                    wait_time = (2 ** retries) * MIN_INTERVAL  # 指数退避
+                    print(f"[速率限制] 等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"[在线查询失败] IP: {ip} 达到最大重试次数")
+                    return "XX"
+            
+            # 检查其他状态码
+            if response.status_code != 200:
+                print(f"[在线查询失败] IP: {ip} HTTP状态码: {response.status_code}")
+                return "XX"
+            
+            # 检查响应内容是否为空
+            if not response.text.strip():
+                print(f"[在线查询失败] IP: {ip} 响应为空")
+                return "XX"
+            
+            try:
+                data = response.json()
+            except ValueError as e:
+                print(f"[在线查询失败] IP: {ip} JSON解析错误: {str(e)}")
+                print(f"响应内容: {response.text[:200]}")  # 只打印前200个字符
+                return "XX"
+            
+            if data.get("status") == "success":
+                country_code = data.get("countryCode", "XX")
+                print(f"[在线查询成功] IP: {ip} 国家代码: {country_code}")
+                return country_code
+            else:
+                print(f"[在线查询失败] IP: {ip} 错误信息: {data.get('message', '未知错误')}")
+                return "XX"
+                
+        except requests.exceptions.Timeout:
+            print(f"[在线查询超时] IP: {ip}")
             return "XX"
-        
-        if data.get("status") == "success":
-            country_code = data.get("countryCode", "XX")
-            print(f"[在线查询成功] IP: {ip} 国家代码: {country_code}")
-            return country_code
-        else:
-            print(f"[在线查询失败] IP: {ip} 错误信息: {data.get('message', '未知错误')}")
+        except Exception as e:
+            print(f"[在线查询错误] IP: {ip} 错误信息: {str(e)}")
             return "XX"
             
-    except requests.exceptions.Timeout:
-        print(f"[在线查询超时] IP: {ip}")
-        return "XX"
-    except Exception as e:
-        print(f"[在线查询错误] IP: {ip} 错误信息: {str(e)}")
-        return "XX"
+    return "XX"  # 所有重试都失败后返回XX
 
 def resolve_domain(reader):
     """解析域名获取IP"""
