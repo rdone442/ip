@@ -5,14 +5,48 @@ import os
 import sys
 from dotenv import load_dotenv
 import datetime
+from urllib.parse import quote
 
 def ensure_dir(directory):
     """确保目录存在，如果不存在则创建"""
     if not os.path.exists(directory):
         os.makedirs(directory)
 
+def normalize_ip(ip):
+    """规范化IP地址，处理最后一段大于255的情况"""
+    try:
+        # 移除IPv6的方括号
+        ip = ip.strip('[]')
+        # 分割IP地址
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return None
+            
+        # 转换前三段
+        for i in range(3):
+            if not (0 <= int(parts[i]) <= 255):
+                return None
+                
+        # 处理最后一段
+        last_num = int(parts[3])
+        if last_num > 255:
+            # 计算进位
+            carry = last_num // 256
+            remainder = last_num % 256
+            # 更新第三段
+            parts[2] = str(int(parts[2]) + carry)
+            # 如果第三段超过255，则IP无效
+            if int(parts[2]) > 255:
+                return None
+            # 更新最后一段
+            parts[3] = str(remainder)
+            
+        return '.'.join(parts)
+    except (ValueError, AttributeError):
+        return None
+
 def is_valid_ip(ip):
-    """验证IP地址格式是否有效"""
+    """验证IP地址格式是否有效，支持Cloudflare特殊格式"""
     try:
         # 移除IPv6的方括号
         ip = ip.strip('[]')
@@ -21,8 +55,21 @@ def is_valid_ip(ip):
         # 检查IPv4格式
         if len(parts) != 4:
             return False
-        # 检查每个部分是否在0-255范围内
-        return all(0 <= int(part) <= 255 for part in parts)
+            
+        # 检查前三段是否在0-255范围内
+        for i in range(3):
+            if not (0 <= int(parts[i]) <= 255):
+                return False
+                
+        # 检查最后一段
+        last_num = int(parts[3])
+        if last_num <= 255:
+            return True
+            
+        # 如果最后一段大于255，检查是否可以规范化
+        normalized_ip = normalize_ip(ip)
+        return normalized_ip is not None
+            
     except (ValueError, AttributeError):
         return False
 
@@ -203,8 +250,10 @@ def read_ip_from_url(reader):
         # 处理每个URL
         for url in urls:
             try:
+                # 对URL进行编码，确保特殊字符被正确处理
+                encoded_url = quote(url, safe=':/?=')
                 print(f"\n[URL读取] 正在从 {url} 获取IP列表...")
-                response = requests.get(url, timeout=10)  # 添加超时设置
+                response = requests.get(encoded_url, timeout=10)
                 response.raise_for_status()
                 
                 ip_list = response.text.strip().split()
@@ -214,17 +263,23 @@ def read_ip_from_url(reader):
                     if not ip:
                         continue
                         
-                    # 添加IP验证
+                    # 添加IP验证和规范化
                     if not is_valid_ip(ip):
                         print(f"[URL读取] 跳过无效IP: {ip}")
                         continue
                         
-                    country_code = get_country_code(ip, reader)
-                    # 为每个端口生成一个结果
+                    # 规范化IP地址
+                    normalized_ip = normalize_ip(ip) or ip
+                    country_code = get_country_code(normalized_ip.strip('[]'), reader)
+                    
+                    # 为每个端口生成一个结果，使用规范化的IP
                     for port in ports:
-                        result = f'{ip}:{port}#{country_code}'
+                        result = f'{normalized_ip}:{port}#{country_code}'
                         results.append(result)
-                        print(f"[URL读取] {result}")
+                        if ip != normalized_ip:
+                            print(f"[URL读取] {result} (原始IP: {ip})")
+                        else:
+                            print(f"[URL读取] {result}")
                         
                         # 将结果添加到对应国家的列表中
                         if country_code not in country_results:
