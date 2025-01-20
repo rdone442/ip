@@ -126,7 +126,23 @@ def get_country_code(ip, reader):
     try:
         print(f"[尝试在线查询] IP: {ip}")
         response = requests.get(f"http://ip-api.com/json/{ip}", timeout=3)
-        data = response.json()
+        
+        # 检查响应状态码
+        if response.status_code != 200:
+            print(f"[在线查询失败] IP: {ip} HTTP状态码: {response.status_code}")
+            return "XX"
+            
+        # 检查响应内容是否为空
+        if not response.text.strip():
+            print(f"[在线查询失败] IP: {ip} 响应为空")
+            return "XX"
+            
+        try:
+            data = response.json()
+        except ValueError as e:
+            print(f"[在线查询失败] IP: {ip} JSON解析错误: {str(e)}")
+            print(f"响应内容: {response.text[:200]}")  # 只打印前200个字符
+            return "XX"
         
         if data.get("status") == "success":
             country_code = data.get("countryCode", "XX")
